@@ -1,0 +1,586 @@
+07:30 2017-11-30
+
+# 实验平台
+
+Ubuntu 14.04
+
+
+#===================================================
+
+原理
+
+每当用户从Shadowsocks 服务器上获取数据时，服务器的iptables 会在OUTPUT 链上记录下经过了多少流量。
+为了精确区分这些流量走的分别是哪些端口，需要在iptables 上建立相应的规则，例如：
+
+假设Server 的IP 是104.207.135.28，开放的端口为9004，iptables 默认是filter 表，所以-t filter 可省略
+
+# 在入口以目标地址为104.207.135.28 及目标端口为9004 的流量放行
+sudo iptables -A INPUT -d 104.207.135.28 -p tcp --dport 9004 -j ACCEPT
+
+# 在出口以源地址为104.207.135.28 及源端口为9004 的流量放行
+sudo iptables -A OUTPUT -s 104.207.135.28 -p tcp --sport 9004 -j ACCEPT
+
+# 设置规则后利用后台进程每隔1 秒查看一下流量情况
+sudo iptables -nvxwL --line-numbers
+# 参数说明
+-n  不做反向解析，DOMAIN-->IP 是正向解析，IP-->DOMAIN 是反向解析，仅以IP 显示，不显示域名。
+-v  详细信息，加上-x 参数可使第三字段bytes 显示单位为byte，否则其将自动转为B/M/G 等。
+-x  参看-v
+-w  等待同步锁，可能有多个进程调用了iptables 来查看，别人用完了本程序就可以看了。
+-L  查看某条链上的规则，默认全部，OUTPUT/INPUT/FORWARD。
+
+# 发现端口流量有超出允许范围则修改规则关闭通道，入口出口均关闭
+sudo iptables -A INPUT -d 104.207.135.28 -p tcp --dport 9005 -j DROP
+sudo iptables -A OUTPUT -s 104.207.135.28 -p tcp --sport 9005 -j DROP
+
+以上就是本脚本背后的基本流程，如果用本脚本开放或关闭某一端口，它会先清理与该端口相关的旧规则和后台进程。
+sudo iptables -D OUTPUT -s 104.207.135.28 -p tcp --sport 9004 -j ACCEPT
+sudo iptables -D OUTPUT -s 104.207.135.28 -p tcp --sport 9004 -j DROP
+sudo iptables -D INPUT -d 104.207.135.28 -p tcp --dport 9004 -j ACCEPT
+sudo iptables -D INPUT -d 104.207.135.28 -p tcp --dport 9004 -j DROP)
+
+值得注意的是删除规则时，必须和添加规则时的参数绝对一模一样。
+
+
+#===================================================
+
+用例
+
+root@vultr:/opt/ss# ./ssdm.sh -h
+   Usage:
+   ssdm.sh {-v} {-h} {-l} {-i} {-o allow|forbid|clean(all)|view [-s Server_IPAddress] -p PORT -c numG|M} [-x SUDOPSWD]
+
+   Options:
+   -h Help 帮助
+   -l List daemon processes 列出所有的后台监控进程
+   -i List IPs and iptables of server 列出服务器所有IP
+   -o Operate types
+      allow      : Allow limited data through a port 允许某端口流经的流量
+      forbid     : Forbid any data through a port 禁止某端口通过流量
+      clean(all) : Clean iptables and daemon process by conditions or clean them all 清除某端口的设置(允许或禁止)，cleanall 表全部清除
+      view       : View current status 查看当前的状态，规则列表及流量使用率
+   -s Server IP address 指定服务器IP，可选，默认ifconfig 的第一块网卡地址
+   -p Server port 指定服务器端口
+   -c Data capacity 指定允许的流量
+   -x Password of sudo 指定sudo 的密码，设置iptables 用
+   -v Show Version 查看本脚本版本
+
+
+以服务器端口9004 为例
+
+# 开放本机9004，以104.207.135.28 作为通信地址，流量限制30GB
+./ssdm.sh -o allow -s 104.207.135.28 -p 9004 -c 30GB
+# -s 参数是可选的，默认用ifconfig 中显示的第一个地址，./ssdm.sh -i 可查看服务器所以IP
+
+
+
+#===================================================
+
+测试
+
+将ssdm.sh 加入环境变量的/usr/bin 里
+sudo ln -s /opt/ss/ssdm.sh /usr/bin/ssdm.sh
+注意软连接一定要给原脚本名字一样，否则无法运行(脚本内有检测)
+
+设置放行规则
+ssdm.sh -o allow -p 9004 -c 200m
+
+创建存放测试文件的文件夹
+cd && mkdir temp && cd temp
+
+# 创建指定大小的文件(300M，1.5G)，注意bs 小反而速度快
+dd if=/dev/zero of=300MB.file bs=100M count=3
+# 推荐这样做，bs 小，count 大，创建时间更短
+dd if=/dev/zero of=300MB.file bs=1M count=300
+dd if=/dev/zero of=1.5GB.file bs=1M count=1536
+
+
+启动Python HTTP 简单服务
+# Python2(推荐)
+python -m SimpleHTTPServer 9004
+# Python3
+python3 -m http.server 9004
+
+
+浏览器访问
+http://104.207.135.28:9004
+下载300MB.file 文件，在下载到200MB 左右的时候iptables 规则应该会被后台的ssdm.sh 改变导致下载不完成。
+
+清理规则及后台进程
+ssdm.sh -o cleanall
+
+
+
+#===================================================
+
+ssdm.sh 脚本及中文注释，但由于是初稿，难免会有bug，所以最终以ssdm.sh 文件内容为准
+
+#!/bin/bash
+
+
+#############################################################################
+# Initialization
+
+# Name of this shell and amending tips for soft link
+PNAME=`ls -l $0 | sed -e 's/\ /\//g'`
+SNAME=${PNAME##*/}
+ENAME=${0##*/}
+echo $0
+echo PN=$PNAME  # Prepared name
+echo SN=$SNAME  # Script name
+echo EN=$ENAME  # Runtime name
+
+# 如果ls -l 出来的PNAME 以l 开头则为软连接，判断其名字与实际脚本名是否一致，
+# 这关系到清理后台进程，如果不一致则不让运行，并给出修改软连接的命令。
+# If soft link name does not equal script name then stop the program  
+if [[ $PNAME == l* && $SNAME != $ENAME ]]; then
+  echo "Illegel soft link name! Please use commands below to rebuild it:"
+  echo "sudo rm -rf $0"
+  echo "sudo ln -s /${PNAME##*//} ${0%/*}/$SNAME"
+  exit -1
+fi
+
+
+# Version
+VERSION="$SNAME v1.0.09"  # 本脚本版本用于版本控制
+
+# 获取服务器IP 地址，默认取第一块网卡的IP
+# Set localhost 1st IP address as source address
+sip=$(ifconfig | awk '/inet addr:/{split($2, ips, ":"); print ips[2]}' | awk '{if(NR==1) print $1}')
+
+# 默认的sudo 密码，要可以通过参数-x 指定
+# Password of sudo
+pswd="123"
+
+
+
+#############################################################################
+# Define Functions
+# 执行之前先显示命令到屏幕
+EXEC_CMD()
+{
+  echo "Exec("$@")"
+  $@
+}
+
+# 用例和使用帮助，通过echo -e 添加了字体颜色
+USAGE_HELP()
+{
+  # String of usage and help with color display
+  echo -e "\
+  \033[7m Usage: \033[m
+  \033[32m\
+  \b$SNAME {-v} {-h} {-l} {-i} {-o allow|forbid|clean(all)|view [-s Server_IPAddress] -p PORT -c numG|M} [-x SUDOPSWD]\n\
+  \033[m \n\
+  \033[7m Options: \033[m\033[32m
+   -h Help
+   -l List daemon processes
+   -i List IPs and iptables of server
+   -o Operate types
+      allow      : Allow limited data through a port
+      forbid     : Forbid any data through a port
+      clean(all) : Clean iptables and daemon process by conditions or clean them all 
+      view       : View current status
+   -s Server IP address
+   -p Server port
+   -c Data capacity
+   -x Password of sudo
+   -v Show Version
+  \033[m "
+}
+
+# 列出后台监控进程
+LIST_DAEMONS()
+{
+  ps -ef | grep $SNAME | grep -v "grep" | grep -v "$SNAME \-l"
+}
+
+# 列出iptables 内容和本机所有IP
+LIST_IPS_IPTABLES()
+{
+  echo -e "\033[7m Local IPTABLES: \033[m"
+  # Switch to sudo and put standard and error output to /dev/null
+  echo $pswd | sudo -S date &> /dev/null
+  # iptables -n 以IP 显示，-v 详细模式，-w 多实例同步，-L OUT/IN/FORWARD 都显示，--line-number 规则行号
+  sudo iptables -nvwL --line-number 
+  echo
+  echo -e "\033[7m Local Source IPs: \033[m"
+  ifconfig | awk '/inet addr:/{split($2, ips, ":"); print ips[2]}' | \
+    awk '{if(NR==1) print "\033[40;33m"$1" <-- default \033[m"; else print $1}'
+}
+
+# 检测IP 有效性，每一段小于255 且都由数字组成
+check_ip_validity()
+{
+  IP=$1
+  VALID_CHECK=$(echo $IP | awk -F. '$1<=255&&$2<=255&&$3<=255&&$4<=255 {print "yes"}')
+  if echo $IP | grep -E "^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$" > /dev/null; then
+    if [ ${VALID_CHECK:-no} == "yes" ]; then
+      echo "IP $IP available."
+    else
+      echo "IP $IP not available!"
+      exit 3
+    fi
+  else
+    echo "IP $IP format error!"
+    exit 3
+  fi
+}
+
+# 检测端口的有效性，必须是数字
+check_port_validity()
+{
+  case "$1" in 
+    [1-9][0-9]*)  
+      #echo "$sport is number."
+      ;;
+    *)  
+      echo "Port $sport is not a number." ; exit 3 ;; 
+  esac
+}
+
+# 计算流量，将MB、GB 等单位转化成Bytes
+calculate_capacity()
+{
+  # Uppercase characters and extract last 1 char or 2 chars as Capacity Unit
+  # 将参数都转成大写，获取最后1 到2 个字符进行判断
+  unit=`echo $1 | tr '[a-z]' '[A-Z]'`
+  if [ ${unit:0-1} == 'M' ] || [ ${unit:0-2} == 'MB' ]; then
+    unit=1024*1024
+  elif [ ${unit:0-1} == 'G' ] || [ ${unit:0-2} == 'GB' ]; then
+    unit=1024*1024*1024
+  else
+    echo "Illegal capacity unit [$unit]"
+    exit 3
+  fi
+
+  # Remove chars from arg1 leave numbers only 
+  # 去除所有字符对剩下的数字进行判断
+  num=`echo $1 | tr -d [:alpha:]`
+  if [ "x" == "x$num" ]; then
+    echo "Illegal capacity number"
+    exit 3
+  fi
+
+  # Return capacity in byte unit
+  echo $num'*'$unit|bc
+}
+
+# 撤销后台进程
+DATA_DAEMON_UNSET()
+{
+  echo "DATA DAEMON UNSET : $@"
+  # If unset caused by EXCESS do nothing or it will kill itself, ${!#} means last arg 
+  # 如果最后一个参数是EXCESS 则表示该调用来自于后台监控程序，直接让本进程结束即可。
+  echo LASTARG=${!#}
+  if [ "${!#}" == "EXCESS" ]; then return 0; fi
+
+  # Kill daemon process
+  # 查找出所有指定条件的后台进程PID 并kill 掉
+  echo "ps -ef | grep $SNAME | grep -v 'grep' | grep '-p $2' | awk '\$3==1 {print \$2}'"
+  IDS=`ps -ef | grep "$SNAME" | grep -v 'grep' | grep "\-p $2" | awk '$3==1 {print $2}'`  
+  echo "DAEMON_IDs={$IDS}"
+  for id in $IDS; do kill -9 $id; done
+}
+
+# DataSupervisor 的按条件清理方法，清理后台进程和iptables 规则
+DataSupervisor_clean()
+{
+  echo "clean func : $@"
+  # Switch to sudo and put standard and error output to /dev/null
+  echo $pswd | sudo -S date &> /dev/null
+
+  # Clean the rules in OUTPUT
+  echo "Cleaning OUTPUT ACCEPT"
+  while (($?==0)); do
+    EXEC_CMD sudo iptables -D OUTPUT -s $1 -p tcp --sport $2 -j ACCEPT
+  done
+
+  echo "Cleaning OUTPUT DROP"
+  while (($?==0)); do
+    EXEC_CMD sudo iptables -D OUTPUT -s $1 -p tcp --sport $2 -j DROP
+  done
+
+  # Clean the rules in INPUT
+  echo "Cleaning INPUT ACCEPT"
+  while (($?==0)); do
+    EXEC_CMD sudo iptables -D INPUT -d $1 -p tcp --dport $2 -j ACCEPT
+  done
+
+  echo "Cleaning INPUT DROP"
+  while (($?==0)); do
+    EXEC_CMD sudo iptables -D INPUT -d $1 -p tcp --dport $2 -j DROP
+  done
+
+  # Unset daemon process
+  DATA_DAEMON_UNSET $@
+
+  echo "Cleaning INPUT/OUTPUT rules and killing daemon process done!!!"
+}
+
+# DataSupervisor 的全清理方法，原理同clean 方法
+DataSupervisor_cleanall()
+{
+  echo "cleanall func : $@"
+
+  # Display all daemon processes
+  ps -ef | grep $SNAME | grep -v "grep" | grep "allow" | awk '{ for(i=1; i<=8; i++){ $i="" }; print "dps["NR-1"]=\""$0"\"" }'
+
+  # Same command like above to build a array
+  eval $(ps -ef | grep $SNAME | grep -v "grep" | grep "allow" | awk '{ for(i=1; i<=8; i++){ $i="" }; print "dps["NR-1"]=\""$0"\"" }')
+
+  # Display the count of array 'dsp'
+  echo "\${#dps[@]}="${#dps[@]}
+
+  # Analyze option of daemon processes
+  # 分析所有后台进程并获取每一个进程的全部参数传给clean 方法去清理
+  for((i=0;i<${#dps[@]};i++)); do
+    eval set -- ${dps[i]}
+    while(($#>0)); do
+      case "$1" in
+        '-s') sip=$2; shift 2 ;;
+        '-p') sport=$2; shift 2 ;;
+        *) shift ;; 
+      esac
+    done
+
+    # Invoke clean operate with parsed arguments
+    EXEC_CMD DataSupervisor_clean $sip $sport
+  done
+
+}
+
+# DataSupervisor 的禁止方法，其先会调用clean 方法在设置iptables DROP 规则
+DataSupervisor_forbid()
+{
+  echo "forbid func : $@"
+  # Switch to sudo and put standard and error output to /dev/null
+  echo $pswd | sudo -S date &> /dev/null
+
+  # Clean old rules and daemon processes
+  DataSupervisor_clean $@
+  
+  # Add new rules
+  EXEC_CMD "sudo iptables -A INPUT -d $1 -p tcp --dport $2 -j DROP"
+  EXEC_CMD "sudo iptables -A OUTPUT -s $1 -p tcp --sport $2 -j DROP"
+
+  echo "Setting forbidden rules done!!!"
+}
+
+# 后台程序设置
+DATA_DAEMON_SET()
+{
+  echo "DATA DAEMON SET : $@"
+  # Switch to sudo and put standard and error output to /dev/null
+  echo $pswd | sudo -S date &> /dev/null
+
+  while true; do
+    eval $(sudo iptables -nxvwL OUTPUT | awk '$3=="ACCEPT"&&$8=="'$1'"&&$11=="spt:'$2'" {print "ucp="$2}')
+
+    # 如果是超过流量则在参数列表最后加上EXCESS 表示不是认为设置的forbid 操作
+    if (($ucp>=$3)); then
+      DataSupervisor_forbid $@ "EXCESS"
+      exit 0
+    fi 
+
+    sleep 1
+  done
+}
+
+# DataSupervisor 的允许方法，其会先调用clean 方法，再设置iptables 的ACCEPT 规则
+DataSupervisor_allow()
+{
+  echo "allow func : $@"
+  # Switch to sudo and put standard and error output to /dev/null
+  echo $pswd | sudo -S date &> /dev/null
+
+  # Clean old rules and daemon processes
+  DataSupervisor_clean $@
+  
+  # Add new rules
+  EXEC_CMD "sudo iptables -A INPUT -d $1 -p tcp --dport $2 -j ACCEPT"
+  EXEC_CMD "sudo iptables -A OUTPUT -s $1 -p tcp --sport $2 -j ACCEPT"
+
+  # Set daemon process
+  DATA_DAEMON_SET $@ &
+
+  sleep 1
+  echo "Adding rules and setting daemon process done!!!"
+}
+
+# DataSupervisor 的查看状态方法，可查看iptables 现有规则及流量使用率
+DataSupervisor_view()
+{
+  echo "view func : $@"
+  # 通过简单密码先给sudo 传递密码，&> 表示标准输出和错误输出
+  # Switch to sudo and put standard and error output to /dev/null
+  echo $pswd | sudo -S date &> /dev/null
+
+  clear
+  #EXEC_CMD "sudo iptables -nvwL --line-number"
+  # iptables 的-w 参数是为了使多个iptables 命令同时执行时不冲突的同步选项
+  EXEC_CMD "sudo iptables -nw -L INPUT"
+  EXEC_CMD "sudo iptables -nw -L OUTPUT"
+
+  # 获取后台进程的PID 用于清理kill
+  # To build a array of daemon processes' detail
+  eval $(ps -ef | grep $SNAME | grep -v "grep" | grep "allow" | awk '{ for(i=1; i<=8; i++){ $i="" }; print "dps["NR-1"]=\""$0"\"" }')
+
+  # Display the count of array 'dsp'
+  echo "\${#dps[@]}="${#dps[@]}
+
+  # Store iptables result to temp file
+  # 将iptables 的内容存入临时文件以便后续分析操作
+  tmpf="/tmp/_9527.9527_"
+  sudo iptables -nvwL OUTPUT > $tmpf
+
+  # 分析后台进程获取流量数值并结合iptables 已用的bytes 来表示使用率
+  # Analyze option of daemon processes
+  for((i=0;i<${#dps[@]};i++)); do
+    eval set -- ${dps[i]}
+    while(($#>0)); do
+      case "$1" in
+        '-s') sip=$2; shift 2 ;;
+        '-p') sport=$2; shift 2 ;;
+        '-c') cpct=`echo $2 | tr [a-z] [A-Z]`; shift 2 ;;
+        *) shift ;; 
+      esac
+    done
+
+    # Print matched results
+    awk '$3=="ACCEPT"&&$8=="'"$sip"'"&&$11=="'"spt:$sport"'" {print $3"--"$8"--"$11"--"$2"/'"$cpct"'"}' $tmpf
+  done
+}
+
+# DataSupervisor 根据传入的参数使用eval 调用相应的方法，类似于面向对象中的重载
+DataSupervisor()
+{
+  # Invoke different function by subname
+  EXEC_CMD eval "${FUNCNAME[0]}_$1" $2 $3 $4 $5
+}
+
+
+
+#############################################################################
+# Obtain arguments
+# No colon after character means the option with no parameter
+# 使用bash 内置的getopts 获取脚本选项和参数，后面带有: 的选项必须要有参数
+while getopts "o:s:p:c:x:ilhv" arg
+do
+  # Parameter stored in $OPTARG
+  case $arg in
+    o)
+      # Operate Type
+      # In eval \$\_$arg equals var $_o, ':-' means using default value when var is not defined or is empty. 
+      # 防止重复出入同一个参数，使用过后会将该参数的标识设为SET，初始为UNSET
+      eval [[ \$\{\_$arg\:\-UNSET\} != "UNSET" ]] \
+        && { echo "Duplicated option -$arg "; exit 1; } \
+        || { oprt="$OPTARG"; eval \_$arg="SET"; } ;;
+    s)
+      # Server IP 
+      eval [[ \$\{\_$arg\:\-UNSET\} != "UNSET" ]] \
+        && { echo "Duplicated option -$arg "; exit 1; } \
+        || { sip="$OPTARG"; eval \_$arg="SET"; } ;;
+    p)
+      # Server Port
+      eval [[ \$\{\_$arg\:\-UNSET\} != "UNSET" ]] \
+        && { echo "Duplicated option -$arg "; exit 1; } \
+        || { sport="$OPTARG"; eval \_$arg="SET"; } ;;
+    c)
+      # Data Limit
+      eval [[ \$\{\_$arg\:\-UNSET\} != "UNSET" ]] \
+        && { echo "Duplicated option -$arg "; exit 1; } \
+        || { cpct="$OPTARG"; eval \_$arg="SET"; } ;;
+    x)
+      # Password of sudo
+      pswd="$OPTARG" ;;
+    l)
+      # List Data Daemon Process
+      LIST_DAEMONS ; exit 0 ;;
+    i)
+      # For Display Localhost IPs and iptables
+      LIST_IPS_IPTABLES ; exit 0 ;;
+    v)
+      # For Display Localhost IPs and iptables
+      echo $VERSION ; exit 0
+      ;;
+    # All unknown arguments treated as '?' by getopts
+    ?) 
+      USAGE_HELP ; exit 1 ;;
+  esac
+done
+
+
+#############################################################################
+# Main Program
+
+# Check -o viewall
+if [ "$oprt" == "view" ]; then
+  DataSupervisor_view
+  exit 0
+
+elif [ "$oprt" == "cleanall" ]; then
+  DataSupervisor_cleanall
+  exit 0
+
+# Check necssary options
+elif [ "x$oprt" == "x" ] || [ "x$sip" == "x" ] || [ "x$sport" == "x" ] ; then
+  echo "Missing essential options and arguments -o and -p"
+  USAGE_HELP ; exit 1
+
+# Check -o in clean | view | forbid
+elif [ "$oprt" == "clean" ] || [ "$oprt" == "view" ] || [ "$oprt" == "forbid" ]; then
+  eval DataSupervisor_$oprt $sip $sport
+  exit 0
+
+# Check arg of data capacity 
+elif [ "$oprt" == "allow" ] && [ "x$cpct" == "x" ] ; then
+  echo "Missing essential option and argument -c"
+  USAGE_HELP ; exit 1
+
+fi
+
+# Check IP address validity
+# 获取方法中exit 的返回值进行判断，否则方法里的exit 会让整个脚本退出
+rtn=`check_ip_validity $sip`
+[ $? -eq 0 ] || { echo $rtn; exit 3; }
+
+# Check Port validity
+rtn=`check_port_validity $sport`
+[ $? -eq 0 ] || { echo $rtn; exit 3; }
+
+# Calculate exactly bytes
+rtn=`calculate_capacity $cpct`
+[ $? -eq 0 ] && cpct=$rtn ||  { echo $rtn; exit 3; }
+
+# Display checked results
+echo Operate_Type=$oprt
+echo Server_IP=$sip
+echo Server_Port=$sport
+echo Data_Limit=$cpct'(bytes)'
+
+# Identify operate type
+case $oprt in 
+  allow | forbid | clean | cleanall | view )
+    DataSupervisor $oprt $sip $sport $cpct
+    ;; 
+  *)
+    echo "Unknown operate type - $oprt"
+    USAGE_HELP ; exit 4 ;;
+esac
+
+
+
+#############################################################################
+
+
+
+
+
+
+
+
+
+
+#===================================================
+Finish!
